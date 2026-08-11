@@ -1,0 +1,10 @@
+# Secrets are injected at runtime by docker-compose (env_file), never baked in
+.env
+__pycache__
+*.pyc
+.deepeval
+.pytest_cache
+.venv
+venv
+Dockerfile
+.dockerignore

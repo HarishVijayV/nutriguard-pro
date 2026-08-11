@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+requests
 tavily-python
 google-genai
 langchain-huggingface

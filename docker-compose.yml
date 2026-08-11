@@ -1,0 +1,50 @@
+# NutriGuard Pro — whole stack, one command:
+#   docker compose up --build
+#
+#   Frontend  → http://localhost:3000
+#   Backend   → http://localhost:8000  (docs at /docs, providers at /health/providers)
+#
+# All API keys come from ./backend/.env — the same file the app already used
+# when you ran it locally. Nothing was moved.
+
+services:
+  backend:
+    build: ./backend
+    image: nutriguard-backend
+    container_name: nutriguard-backend
+    env_file:
+      - ./backend/.env
+    # The image listens on 7860 (Hugging Face Spaces convention). We publish it
+    # as 8000 so the frontend's existing default API URL keeps working untouched.
+    ports:
+      - "8000:7860"
+    volumes:
+      # Persist patients/food_nodes and the Chroma index on the host, so a
+      # `docker compose down` doesn't wipe researched states or your PDF index.
+      - ./backend/nutriguard.db:/app/nutriguard.db
+      - ./backend/chroma_db:/app/chroma_db
+    healthcheck:
+      # python:slim has no curl, so ping with urllib instead.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # First boot loads sentence-transformers + Chroma and probes every LLM
+      # provider, which can take a couple of minutes on a cold start.
+      start_period: 180s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the browser bundle at build time. Override for a LAN demo:
+        #   NEXT_PUBLIC_API_URL=http://192.168.1.20:8000 docker compose up --build
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    image: nutriguard-frontend
+    container_name: nutriguard-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped

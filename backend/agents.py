@@ -6,7 +6,8 @@ Provider chain (auto-fallback, with parallel health probe):
   1. Gemini  (3 models × up to 2 keys)
   2. Groq    (Llama 3.3 70B → Llama 3.1 8B)            via GROQ_API_KEY
   3. OpenRouter (free Gemini/Llama/Qwen)                via OPENROUTER_API_KEY
-  4. Hardcoded clinically-safe template (Kerala-tuned)
+  4. Fireworks (last real LLM, fully env-driven)        via FIREWORKS_API_KEY + FIREWORKS_MODEL
+  5. Hardcoded clinically-safe template (Kerala-tuned)
 
 Speed improvement:
   At startup, all providers are probed IN PARALLEL (~3-5 sec one-time cost).
@@ -68,6 +69,32 @@ OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "qwen/qwen-2.5-72b-instruct:free",
 ]
+
+# ── Fireworks: last real-LLM fallback, configured 100% from .env ──
+# FIREWORKS_API_KEY     required — leave empty/unset to disable this tier
+# FIREWORKS_MODEL       one model id, or several separated by commas (tried in order)
+# FIREWORKS_BASE_URL    override only if Fireworks changes their endpoint
+# FIREWORKS_MAX_TOKENS  bumped by default so a full 7-day JSON plan isn't truncated
+FIREWORKS_API_KEY = (os.getenv("FIREWORKS_API_KEY") or "").strip()
+FIREWORKS_MODELS = [
+    m.strip() for m in (os.getenv("FIREWORKS_MODEL") or "").split(",") if m.strip()
+]
+FIREWORKS_BASE_URL = (
+    os.getenv("FIREWORKS_BASE_URL")
+    or "https://api.fireworks.ai/inference/v1/chat/completions"
+).strip()
+# Generous default: DeepSeek "flash" spends tokens on reasoning before the JSON,
+# and a truncated 7-day plan is unparseable. Lower it only to cut cost.
+FIREWORKS_MAX_TOKENS = int(os.getenv("FIREWORKS_MAX_TOKENS") or 8192)
+
+print(
+    "[agents.py] Fireworks fallback:  "
+    + (
+        f"enabled ({', '.join(FIREWORKS_MODELS)})"
+        if FIREWORKS_API_KEY and FIREWORKS_MODELS
+        else "disabled (need FIREWORKS_API_KEY + FIREWORKS_MODEL)"
+    )
+)
 
 OFFLINE_LABEL = "Offline Clinical Template"
 COOLDOWN_SECONDS = 300         # mark provider dead for 5 min after a real failure
@@ -248,6 +275,45 @@ def _openrouter_call(model: str, prompt: str, json_mode: bool) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 
+def _strip_json_noise(text: str) -> str:
+    """
+    DeepSeek-style 'flash'/reasoning models sometimes wrap their answer in a
+    <think>...</think> block or a ```json fence. Both break json.loads(), so
+    peel them off before handing the text back to the graph.
+    """
+    if not text:
+        return text
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    return cleaned or text
+
+
+def _fireworks_call(model: str, prompt: str, json_mode: bool) -> str:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": FIREWORKS_MAX_TOKENS,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    r = requests.post(
+        FIREWORKS_BASE_URL,
+        headers={
+            "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=90,
+    )
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"]
+    return _strip_json_noise(content) if json_mode else content
+
+
 # ── Provider registry: id -> (call_fn, model_label) ───────────────
 def _build_provider_registry() -> list[tuple[str, Callable[[str, bool], str], str]]:
     """Returns list in PRIORITY ORDER: (provider_id, call_fn, model_label_for_eval)."""
@@ -268,6 +334,13 @@ def _build_provider_registry() -> list[tuple[str, Callable[[str, bool], str], st
         for model in OPENROUTER_MODELS:
             pid = f"openrouter/{model}"
             registry.append((pid, lambda p, j, m=model: _openrouter_call(m, p, j), f"openrouter/{model}"))
+
+    # Fireworks LAST: the guaranteed real-LLM safety net once every free tier
+    # above has run out of quota. Only the offline template sits below it.
+    if FIREWORKS_API_KEY and FIREWORKS_MODELS:
+        for model in FIREWORKS_MODELS:
+            pid = f"fireworks/{model}"
+            registry.append((pid, lambda p, j, m=model: _fireworks_call(m, p, j), pid))
 
     return registry
 
