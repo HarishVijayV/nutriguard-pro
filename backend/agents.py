@@ -58,16 +58,21 @@ print(f"[agents.py] Loaded {len(API_KEYS)} Gemini API key(s)")
 print(f"[agents.py] Groq fallback:       {'enabled' if os.getenv('GROQ_API_KEY') else 'disabled (no GROQ_API_KEY)'}")
 print(f"[agents.py] OpenRouter fallback: {'enabled' if os.getenv('OPENROUTER_API_KEY') else 'disabled (no OPENROUTER_API_KEY)'}")
 
+# gemini-2.0-flash removed: Google retired it (hard 404, "no longer available").
+# gemini-2.5-flash-lite is KEPT — its 503s are transient high-demand, and the
+# 5-minute circuit breaker lets it come back on its own.
 GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
 ]
 GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+# Refreshed: the old gemini-2.0-flash-exp / llama-3.3-70b / qwen-2.5-72b ":free"
+# ids were renamed upstream and 404'd. These three are verified live and confirmed
+# to honour response_format=json_object, largest first.
 OPENROUTER_MODELS = [
-    "google/gemini-2.0-flash-exp:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-20b:free",
+    "google/gemma-4-26b-a4b-it:free",
 ]
 
 # ── Fireworks: last real-LLM fallback, configured 100% from .env ──

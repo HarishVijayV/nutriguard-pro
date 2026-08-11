@@ -268,17 +268,19 @@ def compute_eval_scores(audit_result: dict, iterations: int, model_used: str) ->
 
     model_scores = {
         "gemini-2.5-flash": 100,
-        "gemini-2.0-flash": 78,
         "gemini-2.5-flash-lite": 55,
         "groq/llama-3.3-70b-versatile": 88,
         "groq/llama-3.1-8b-instant": 60,
-        "openrouter/google/gemini-2.0-flash-exp:free": 75,
-        "openrouter/meta-llama/llama-3.3-70b-instruct:free": 80,
-        "openrouter/qwen/qwen-2.5-72b-instruct:free": 72,
+        "openrouter/nvidia/nemotron-3-super-120b-a12b:free": 80,
+        "openrouter/openai/gpt-oss-20b:free": 70,
+        "openrouter/google/gemma-4-26b-a4b-it:free": 68,
         OFFLINE_LABEL: 50,
         "none": 0,
     }
     model_reliability = model_scores.get(model_used, 70)
+    # Fireworks ids are env-driven (and can be a list), so score by prefix.
+    if model_used.startswith("fireworks/"):
+        model_reliability = 85
     used_fallback = model_used not in ("gemini-2.5-flash", "")
 
     return {
