@@ -31,6 +31,7 @@ from agents import (
     OFFLINE_LABEL,
     get_provider_status,
     probe_all_providers,
+    alive_providers,
 )
 
 load_dotenv()
@@ -101,7 +102,7 @@ def health():
 def providers_health():
     """Return cached health status of every LLM provider. No AI call."""
     status = get_provider_status()
-    alive = [pid for pid, s in status.items() if s["alive"]]
+    alive = alive_providers()  # priority order, so primary is the real first choice
     return {
         "alive_count": len(alive),
         "total": len(status),
@@ -113,8 +114,11 @@ def providers_health():
 @app.post("/health/reprobe")
 def providers_reprobe():
     """Re-run the parallel health probe on demand. Useful before a demo."""
-    status = probe_all_providers()
-    alive = [pid for pid, s in status.items() if s["alive"]]
+    try:
+        status = probe_all_providers()
+    except Exception as e:
+        return {"error": str(e)[:200], "providers": get_provider_status()}
+    alive = alive_providers()
     return {
         "alive_count": len(alive),
         "total": len(status),

@@ -28,6 +28,7 @@ import time
 from typing import TypedDict, Callable
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
@@ -105,6 +106,9 @@ OFFLINE_LABEL = "Offline Clinical Template"
 COOLDOWN_SECONDS = 300         # mark provider dead for 5 min after a real failure
 PROBE_TIMEOUT_SECONDS = 12     # per-provider timeout during parallel probe
 SKIP_PROBE = os.getenv("SKIP_HEALTH_PROBE", "").lower() in ("1", "true", "yes")
+# The google-genai SDK has no default socket timeout, so a stalled Gemini call
+# could otherwise hang a request (or the startup probe) indefinitely.
+GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS") or 60000)
 
 
 # ── Health cache ──────────────────────────────────────────────────
@@ -140,6 +144,13 @@ def _mark_dead(provider_id: str):
             "alive": False,
             "cooldown_until": _now() + COOLDOWN_SECONDS,
         }
+
+
+def alive_providers() -> list[str]:
+    """Alive provider ids in PRIORITY order (health dict is in probe-finish order)."""
+    with _health_lock:
+        return [pid for pid, _fn, _label in PROVIDERS
+                if (_provider_health.get(pid) or {}).get("alive")]
 
 
 def get_provider_status() -> dict:
@@ -235,9 +246,11 @@ def _gemini_call(model: str, key: str, prompt: str, json_mode: bool) -> str:
     config = types.GenerateContentConfig(
         response_mime_type="application/json" if json_mode else "text/plain"
     )
-    client = genai.Client(api_key=key)
+    # timeout: the SDK has no default, so a stalled call would hang forever
+    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
     resp = client.models.generate_content(model=model, contents=prompt, config=config)
-    return resp.text
+    # None when safety-blocked/empty — call_gemini treats "" as a failure
+    return resp.text or ""
 
 
 def _groq_call(model: str, prompt: str, json_mode: bool) -> str:
@@ -370,8 +383,10 @@ def probe_all_providers() -> dict:
         return {}
     print(f"[agents.py] Probing {len(PROVIDERS)} providers in parallel...")
     start = _now()
-    with ThreadPoolExecutor(max_workers=len(PROVIDERS)) as exe:
-        futures = {exe.submit(_probe_one, pid, fn): pid for pid, fn, _ in PROVIDERS}
+    exe = ThreadPoolExecutor(max_workers=len(PROVIDERS))
+    futures = {exe.submit(_probe_one, pid, fn): pid for pid, fn, _ in PROVIDERS}
+    done = set()
+    try:
         for fut in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 5):
             try:
                 pid, alive, err = fut.result(timeout=PROBE_TIMEOUT_SECONDS)
@@ -379,15 +394,28 @@ def probe_all_providers() -> dict:
                 pid = futures[fut]
                 alive = False
                 err = str(e)[:120]
+            done.add(pid)
             if alive:
                 _mark_alive(pid)
                 print(f"  [Health] alive   {pid}")
             else:
                 _mark_dead(pid)
                 print(f"  [Health] DOWN    {pid}  ({err})")
+    except FuturesTimeout:
+        # as_completed raises from the generator, so this can't be caught above.
+        # Anything still hanging counts as down; don't let it block startup.
+        print("  [Health] probe window elapsed — remaining providers marked DOWN")
+    finally:
+        # wait=False: never block startup on a hung provider socket
+        exe.shutdown(wait=False, cancel_futures=True)
+
+    for pid in futures.values():
+        if pid not in done:
+            _mark_dead(pid)
+            print(f"  [Health] DOWN    {pid}  (no probe response in time)")
 
     elapsed = _now() - start
-    alive = [pid for pid in _provider_health if _provider_health[pid]["alive"]]
+    alive = alive_providers()
     print(f"[agents.py] Probe done in {elapsed:.1f}s — {len(alive)}/{len(PROVIDERS)} providers alive")
     if alive:
         print(f"[agents.py] Primary alive provider: {alive[0]}")
@@ -415,6 +443,8 @@ def call_gemini(prompt: str, json_mode: bool = True) -> tuple[str, str]:
             tried += 1
             print(f"  [LLM] -> {pid}")
             text = fn(prompt, json_mode)
+            if not (text or "").strip():
+                raise ValueError("empty response")  # blocked/empty → try next provider
             _mark_alive(pid)
             print(f"  [LLM] OK {pid}")
             return text, model_label
@@ -550,7 +580,7 @@ Return JSON:
         state["model_used"] = OFFLINE_LABEL
     else:
         state["meal_plan"] = text
-        if state.get("model_used") != OFFLINE_LABEL or not state.get("model_used"):
+        if state.get("model_used") != OFFLINE_LABEL:
             state["model_used"] = model
 
     return state
@@ -569,14 +599,25 @@ def auditor_node(state: NutriState) -> NutriState:
         }
         return state
 
-    danger_keywords = ["spicy", "fried", "chili", "raw salad", "seeds", "cream", "alcohol", "caffeine"]
-    plan_lower = state["meal_plan"].lower()
+    # word -> spellings to catch (plurals/variants); the word itself is what gets flagged
+    danger_keywords = {
+        "spicy": ["spicy", "spicier"],
+        "fried": ["fried", "fries", "fry"],
+        "chili": ["chili", "chilis", "chilies", "chilli", "chillies", "chile", "chiles"],
+        "raw salad": ["raw salad", "raw salads"],
+        "seeds": ["seed", "seeds"],
+        "cream": ["cream", "creams", "creamy"],
+        "alcohol": ["alcohol", "alcoholic"],
+        "caffeine": ["caffeine", "caffeinated"],
+    }
+    plan_lower = (state.get("meal_plan") or "").lower()
     flags = []
 
-    for word in danger_keywords:
+    for word, variants in danger_keywords.items():
         # Whole-word match AND skip negated mentions like "non-spicy", "no spicy",
         # "without spicy", "avoid spicy", "not spicy".
-        pattern = rf"(?<!\w)(?<!non-)(?<!no )(?<!without )(?<!avoid )(?<!not ){re.escape(word)}(?!\w)"
+        alts = "|".join(re.escape(v) for v in variants)
+        pattern = rf"(?<!\w)(?<!non-)(?<!no )(?<!without )(?<!avoid )(?<!not )(?:{alts})(?!\w)"
         if re.search(pattern, plan_lower):
             result = audit_food(word)
             if result["safety_hint"] == "UNSAFE":
@@ -656,7 +697,7 @@ Return JSON:
         state["model_used"] = OFFLINE_LABEL
     else:
         state["final_plan"] = text
-        state["model_used"] = model
+        # keep the Chef's model in model_used — that's the model that wrote the plan
 
     return state
 
@@ -692,7 +733,11 @@ print("[agents.py] LangGraph workflow ready (Researcher→Chef→Auditor→Judge
 if SKIP_PROBE:
     print("[agents.py] SKIP_HEALTH_PROBE set — startup probe skipped")
 else:
-    probe_all_providers()
+    try:
+        probe_all_providers()
+    except Exception as e:
+        # never let a probe problem stop the API from booting
+        print(f"[agents.py] probe failed ({str(e)[:120]}) — continuing without it")
 
 
 def run_workflow(patient_data: dict) -> dict:

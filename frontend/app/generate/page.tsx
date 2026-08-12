@@ -56,16 +56,23 @@ export default function GeneratePage() {
         }),
       });
 
-      const reader = res.body!.getReader();
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        addLog(`Backend rejected the request (HTTP ${res.status}). ${detail.slice(0, 200)}`);
+        return;
+      }
+      if (!res.body) {
+        addLog("No response stream from backend.");
+        return;
+      }
+
+      const reader = res.body.getReader();
       const decoder = new TextDecoder();
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value);
-        const lines = chunk.split("\n").filter(l => l.startsWith("data: "));
-        for (const line of lines) {
-          const json = line.replace("data: ", "").trim();
+      const handleFrame = (frame: string) => {
+        for (const line of frame.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          const json = line.slice(6).trim();
           if (!json) continue;
           try {
             const data = JSON.parse(json);
@@ -76,13 +83,30 @@ export default function GeneratePage() {
               if (data.eval) setEvalData(data.eval);
               if (data.error) addLog(`ERROR: ${data.error}`);
             }
-          } catch {}
+          } catch {
+            addLog("Skipped an unreadable message from the backend.");
+          }
         }
+      };
+
+      // Buffer across reads: one chunk can split a "data: ..." line in half,
+      // and stream:true keeps multi-byte characters intact at the boundary.
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";   // keep the incomplete tail for next read
+        for (const frame of frames) handleFrame(frame);
       }
+      buffer += decoder.decode();
+      if (buffer.trim()) handleFrame(buffer);
     } catch (e) {
       addLog(`Connection error: ${e}`);
+    } finally {
+      setRunning(false);
     }
-    setRunning(false);
   };
 
   const handleApprove = () => {
